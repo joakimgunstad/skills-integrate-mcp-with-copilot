@@ -5,9 +5,16 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
+import hashlib
+import hmac
+import json
+import secrets
+import threading
+import time
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from pydantic import BaseModel
 import os
 from pathlib import Path
 
@@ -18,6 +25,104 @@ app = FastAPI(title="Mergington High School API",
 current_dir = Path(__file__).parent
 app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
           "static")), name="static")
+
+TEACHERS_FILE = Path(__file__).with_name("teachers.json")
+SESSION_COOKIE = "teacher_session"
+SESSION_DURATION_SECONDS = 8 * 60 * 60
+PASSWORD_HASH_ITERATIONS = 310_000
+teacher_sessions: dict[str, tuple[str, float]] = {}
+session_lock = threading.Lock()
+
+
+class TeacherLogin(BaseModel):
+    username: str
+    password: str
+
+
+def create_teacher_record(username: str, password: str) -> dict[str, str | int]:
+    salt = secrets.token_bytes(16)
+    password_hash = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt, PASSWORD_HASH_ITERATIONS
+    )
+    return {
+        "username": username,
+        "salt": salt.hex(),
+        "password_hash": password_hash.hex(),
+        "iterations": PASSWORD_HASH_ITERATIONS,
+    }
+
+
+def load_teacher_records() -> list[dict[str, str | int]]:
+    try:
+        contents = TEACHERS_FILE.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return []
+
+    try:
+        data = json.loads(contents)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Teacher credentials file contains invalid JSON") from exc
+
+    records = data.get("teachers") if isinstance(data, dict) else None
+    if not isinstance(records, list):
+        raise RuntimeError("Teacher credentials file must contain a teachers list")
+
+    for record in records:
+        if not isinstance(record, dict) or not all(
+            isinstance(record.get(key), expected_type)
+            for key, expected_type in (
+                ("username", str),
+                ("salt", str),
+                ("password_hash", str),
+                ("iterations", int),
+            )
+        ):
+            raise RuntimeError("Teacher credentials file contains an invalid record")
+    return records
+
+
+def verify_teacher_credentials(username: str, password: str) -> bool:
+    for record in load_teacher_records():
+        if record["username"] != username:
+            continue
+        try:
+            salt = bytes.fromhex(record["salt"])
+            expected_hash = bytes.fromhex(record["password_hash"])
+        except ValueError as exc:
+            raise RuntimeError("Teacher credentials file contains an invalid hash") from exc
+
+        actual_hash = hashlib.pbkdf2_hmac(
+            "sha256",
+            password.encode("utf-8"),
+            salt,
+            record["iterations"],
+        )
+        return hmac.compare_digest(actual_hash, expected_hash)
+    return False
+
+
+def get_teacher_session(request: Request) -> str | None:
+    token = request.cookies.get(SESSION_COOKIE)
+    if token is None:
+        return None
+
+    with session_lock:
+        session = teacher_sessions.get(token)
+        if session is None:
+            return None
+        username, expires_at = session
+        if expires_at <= time.time():
+            del teacher_sessions[token]
+            return None
+        return username
+
+
+def require_teacher(request: Request) -> str:
+    username = get_teacher_session(request)
+    if username is None:
+        raise HTTPException(status_code=401, detail="Teacher login required")
+    return username
+
 
 # In-memory activity database
 activities = {
@@ -78,6 +183,45 @@ activities = {
 }
 
 
+@app.post("/auth/login")
+def login_teacher(credentials: TeacherLogin, request: Request, response: Response):
+    if not verify_teacher_credentials(credentials.username, credentials.password):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    token = secrets.token_urlsafe(32)
+    with session_lock:
+        teacher_sessions[token] = (
+            credentials.username,
+            time.time() + SESSION_DURATION_SECONDS,
+        )
+    response.set_cookie(
+        key=SESSION_COOKIE,
+        value=token,
+        max_age=SESSION_DURATION_SECONDS,
+        httponly=True,
+        secure=request.url.scheme == "https",
+        samesite="lax",
+        path="/",
+    )
+    return {"username": credentials.username}
+
+
+@app.get("/auth/session")
+def get_auth_session(request: Request):
+    username = get_teacher_session(request)
+    return {"authenticated": username is not None, "username": username}
+
+
+@app.post("/auth/logout")
+def logout_teacher(request: Request, response: Response):
+    token = request.cookies.get(SESSION_COOKIE)
+    if token is not None:
+        with session_lock:
+            teacher_sessions.pop(token, None)
+    response.delete_cookie(key=SESSION_COOKIE, path="/", samesite="lax")
+    return {"message": "Logged out"}
+
+
 @app.get("/")
 def root():
     return RedirectResponse(url="/static/index.html")
@@ -88,7 +232,7 @@ def get_activities():
     return activities
 
 
-@app.post("/activities/{activity_name}/signup")
+@app.post("/activities/{activity_name}/signup", dependencies=[Depends(require_teacher)])
 def signup_for_activity(activity_name: str, email: str):
     """Sign up a student for an activity"""
     # Validate activity exists
@@ -110,7 +254,10 @@ def signup_for_activity(activity_name: str, email: str):
     return {"message": f"Signed up {email} for {activity_name}"}
 
 
-@app.delete("/activities/{activity_name}/unregister")
+@app.delete(
+    "/activities/{activity_name}/unregister",
+    dependencies=[Depends(require_teacher)],
+)
 def unregister_from_activity(activity_name: str, email: str):
     """Unregister a student from an activity"""
     # Validate activity exists
